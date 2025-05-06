@@ -115,15 +115,19 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 /**
  * Ensures the PostgreSQL table for storing reviews exists
- * Creates the table if it doesn't already exist
+ * Drops the table if it already exists to start fresh
  * 
  * @param pg - PostgreSQL client connection
  */
 async function ensureTable(pg: Client) {
   logger.info("Ensuring database table exists...");
   
+  // Drop the table if it exists
+  await pg.query(`DROP TABLE IF EXISTS google_reviews`);
+  
+  // Create a fresh table
   await pg.query(`
-    CREATE TABLE IF NOT EXISTS google_reviews (
+    CREATE TABLE google_reviews (
       company      text,
       location     text,
       business_url text,
@@ -135,39 +139,18 @@ async function ensureTable(pg: Client) {
       images       text[]
     )`);
     
-  logger.success("Database table ready");
+  logger.success("Database table recreated");
 }
 
 /**
- * Inserts only new reviews into the database (skipping existing ones)
- * This prevents duplicate entries when re-scraping the same business
+ * Inserts reviews into the database without checking for duplicates
  * 
  * @param pg - PostgreSQL client connection
  * @param rows - Array of review objects to insert
  * @returns Promise that resolves when insertion is complete
  */
-async function insertIfNew(pg: Client, rows: ReviewRow[]) {
+async function insert(pg: Client, rows: ReviewRow[]) {
   if (!rows.length) return;
-  
-  // Get all review IDs to check
-  const ids = rows.map(r => r.review_id);
-  
-  // Check which IDs already exist in the database
-  const res = await pg.query(
-    'SELECT review_id FROM google_reviews WHERE review_id = ANY($1)',
-    [ids]
-  );
-  
-  // Create a Set of existing IDs for O(1) lookup
-  const existing = new Set(res.rows.map((r: any) => r.review_id));
-  
-  // Filter out reviews that already exist
-  const fresh = rows.filter(r => !existing.has(r.review_id));
-  
-  if (!fresh.length) {
-    logger.info(`All ${rows.length} reviews already exist in database - skipping insert`);
-    return;
-  }
   
   // Prepare column names and parameterized values for SQL insertion
   const cols = [
@@ -176,7 +159,7 @@ async function insertIfNew(pg: Client, rows: ReviewRow[]) {
   ];
   
   const params: any[] = [];
-  const values = fresh.map((r, i) => {
+  const values = rows.map((r, i) => {
     const o = i * cols.length; 
     // Add all field values to params array
     params.push(...cols.map(c => (r as any)[c]));
@@ -184,111 +167,214 @@ async function insertIfNew(pg: Client, rows: ReviewRow[]) {
     return `(${cols.map((_,j) => `$${o+j+1}`).join(',')})`;
   }).join(',');
 
-  // Insert new reviews with conflict handling
+  // Insert reviews without checking for duplicates
   await pg.query(
-    `INSERT INTO google_reviews(${cols.join(',')}) VALUES ${values}
-     ON CONFLICT (review_id) DO NOTHING`, 
+    `INSERT INTO google_reviews(${cols.join(',')}) VALUES ${values}`, 
     params
   );
   
-  logger.success(`Inserted ${fresh.length} new reviews into database`);
+  logger.success(`Inserted ${rows.length} reviews into database`);
 }
 
 /* ═══════════════════ PAYLOAD PARSING ═══════════════════ */
-/**
- * Regular expression to match Google's JSON security prefix
- * Google prepends ")]}'" to their JSON responses to prevent JSON hijacking
- */
 const XSSI = /^\)\]\}'/;
 
+/* ── utility helpers ──────────────────────────────────── */
+const isUrlLike     = (s: string) => s.startsWith('http') || s.startsWith('/local/');
+const isGoogleToken = (s: string) => /^CAES[0-9A-Za-z+/]+=*$/.test(s);
+const looksCoord    = (s: string) => s.includes('0x0:');
+const isLikelyName  = (s: string) => {
+  if (s.length < 3 || s.length > 60)      return false;
+  if (isUrlLike(s) || isGoogleToken(s))   return false;
+  if (looksCoord(s) || /\d/.test(s))      return false;
+  const words = s.trim().split(/\s+/);
+  if (words.length > 4)                   return false;   // unlikely a real name
+  return words.every(w => /^[A-Z][a-zA-Z'’.‑-]+$/.test(w));
+};
+
 /**
- * Parses Google's review data response into structured review objects
- * 
- * @param raw - Raw response text from Google's API
- * @param ep - Endpoint type ('entities' or 'ugc')
- * @returns Object containing parsed reviews and pagination token
+ * Recursively walk any value, calling strFn for strings and numFn for numbers.
+ */
+function walkDeep(
+  node: any,
+  strFn: (s: string) => void,
+  numFn: (n: number) => void = () => {}
+) {
+  if (typeof node === 'string')      strFn(node);
+  else if (typeof node === 'number') numFn(node);
+  else if (Array.isArray(node))      node.forEach(v => walkDeep(v, strFn, numFn));
+}
+
+/* ═══════════════════ TEXT-EXTRACTION HELPER (v3) ═══════════════════ */
+/**
+ * Recursively searches for the language-tag + nested text array pattern.
+ * Supports both
+ *   ["en", [ ["actual review", …] ]]
+ * and
+ *   [ ["en"], [ ["actual review", …] ] ]
+ * shapes. Returns the first matching review string, or '' if none is found.
+ */
+function extractReviewText(block: any): string {
+  const seen = new Set<any>();
+
+  function recurse(node: any): string | null {
+    if (!Array.isArray(node) || seen.has(node)) return null;
+    seen.add(node);
+
+    // Pattern A: direct string lang + adjacent text-array
+    for (let i = 0; i < node.length - 1; i++) {
+      const lang = node[i];
+      const next = node[i + 1];
+      if (
+        typeof lang === 'string' &&
+        /^[A-Za-z]{2}$/.test(lang) &&
+        Array.isArray(next) &&
+        Array.isArray(next[0]) &&
+        typeof next[0][0] === 'string'
+      ) {
+        return next[0][0].trim();
+      }
+    }
+
+    // Pattern B: array-wrapped lang + array-wrapped text at end
+    if (node.length >= 2) {
+      const pen  = node[node.length - 2];
+      const last = node[node.length - 1];
+      if (
+        Array.isArray(pen) &&
+        pen.length === 1 &&
+        typeof pen[0] === 'string' &&
+        /^[A-Za-z]{2}$/.test(pen[0]) &&
+        Array.isArray(last) &&
+        Array.isArray(last[0]) &&
+        typeof last[0][0] === 'string'
+      ) {
+        return last[0][0].trim();
+      }
+    }
+
+    // dive deeper into every child array
+    for (const child of node) {
+      const hit = recurse(child);
+      if (hit !== null) return hit;
+    }
+
+    return null;
+  }
+
+  return recurse(block) || '';
+}
+
+/**
+ * Grabs the real review-ID for this block.
+ * 1. First tries block[0][0] (the built-in review token).
+ * 2. If that equals the page token (data[1]), falls back to the
+ *    '?p=…' param in the reply URL.
+ */
+function extractReviewId(block: any, pageToken: string): string {
+  // 1) primary: the built-in per-review token
+  const candidate = block?.[0]?.[0];
+  if (typeof candidate === 'string' && candidate !== pageToken) {
+    return candidate;
+  }
+
+  // 2) fallback: look for the reply link containing '?p='
+  let postId: string | null = null;
+  walkDeep(block, (s: string) => {
+    if (!postId && typeof s === 'string' && s.includes('/customers/reviews/reply?p=')) {
+      postId = s.split('p=')[1];
+    }
+  });
+
+  // return whichever we found (or empty string if all else fails)
+  return postId ?? (typeof candidate === 'string' ? candidate : '');
+}
+
+/* ═══════════════════ PAYLOAD PARSER FUNCTION (complete) ═══════════════════ */
+/**
+ * Parses one batch of Google reviews JSON:
+ * 1. strips XSSI prefix
+ * 2. JSON.parse the payload
+ * 3. iterates each review block
+ * 4. extracts review_id, author, rating, date, images
+ * 5. uses extractReviewText to get user’s text ('' if none)
+ * 6. builds next-page token
  */
 function parseBatch(raw: string, ep: Endpoint) {
-  // Remove Google's anti-XSSI prefix from JSON
   const cleaned = raw.replace(XSSI, '').trim();
-  
-  // Try to parse JSON, return empty result if invalid
-  let data: any; 
-  try { 
+  let data: any;
+  try {
     data = JSON.parse(cleaned);
   } catch {
-    logger.warn("Failed to parse JSON response");
+    logger.warn('Failed to parse JSON response');
     return { reviews: [], token: null };
   }
 
-  // Extract blocks containing review data
+  // the array of review blocks lives at data[2]
   const blocks: any[] = Array.isArray(data?.[2]) ? data[2] : [];
-  const reviews: Omit<ReviewRow, 'company'|'location'|'business_url'>[] = [];
+  const reviews: Omit<ReviewRow, 'company' | 'location' | 'business_url'>[] = [];
 
-  /**
-   * Helper function to recursively walk through nested arrays/objects
-   * Used to extract text content from Google's complex response structure
-   * 
-   * @param n - Current node to walk through
-   * @param fn - Callback function for string values
-   */
-  const walk = (n: any, fn: (s: string) => void) => {
-    if (typeof n === 'string') fn(n);
-    else if (Array.isArray(n)) n.forEach(x => walk(x, fn));
-  };
-
-  // Process each review block
   for (const b of blocks) {
     if (!Array.isArray(b)) continue;
-    
-    // Extract review ID (required)
-    const review_id = b?.[0]?.[0];
+
+    // unique review identifier
+    const review_id = extractReviewId(b, data[1]);
     if (!review_id) continue;
 
-    // Extract author name
-    let author = ''; 
-    walk(b?.[0], s => {
-      if (!author && !s.startsWith('http')) author = s;
-    });
-    
-    // Extract rating (can be null for text-only reviews)
-    const ratingRaw = Array.isArray(b?.[2]) ? b[2][0] : b?.[4];
-    const rating = typeof ratingRaw === 'number' ? ratingRaw : null;
-    
-    // Extract review date
-    const review_date = typeof b?.[1] === 'string' ? b[1] : '';
+    // author name lives at b[0][1][4][5][0]
+    let author = '';
+    if (
+      Array.isArray(b?.[0]?.[1]?.[4]?.[5]) &&
+      typeof b[0][1][4][5][0] === 'string'
+    ) {
+      author = b[0][1][4][5][0];
+    }
 
-    // Extract review text
-    let review_text = ''; 
-    walk(b, s => {
-      if (!review_text && !s.startsWith('http')) review_text = s;
-    });
+    // pull the user’s review text ('' if none)
+    const review_text = extractReviewText(b);
 
-    // Extract image URLs
-    const images: string[] = []; 
-    walk(b, s => {
-      if (s.startsWith('http')) images.push(s);
-    });
+    // collect rating, date, and image URLs
+    let rating: number | null = null;
+    let review_date = '';
+    const images = new Set<string>();
 
-    // Add parsed review to results
+    walkDeep(
+      b,
+      (s: string) => {
+        if (!s.startsWith('http') && !review_date) {
+          if (/ago$|Yesterday$|^[A-Za-z]{3}\s\d{4}$|^\d{1,2}\/\d{1,2}\/\d{4}$/.test(s)) {
+            review_date = s;
+          }
+        } else if (s.startsWith('http')) {
+          images.add(s);
+        }
+      },
+      (n: number) => {
+        if (rating === null && Number.isInteger(n) && n >= 1 && n <= 5) {
+          rating = n;
+        }
+      }
+    );
+
     reviews.push({
       review_id,
       author,
       rating,
       review_text,
       review_date,
-      images: [...new Set(images)].slice(0, 8) // Deduplicate and limit to 8 images
+      images: [...images].slice(0, 8)
     });
   }
 
-  // Extract pagination token based on endpoint type
-  const token = ep === 'ugc'
-              ? (typeof data?.[1] === 'string' ? data[1] : null)
-              : (Array.isArray(data?.[data.length-1])
-                  ? data[data.length-1][0] : null);
-                  
+  // build the next page token
+  const token =
+    ep === 'ugc'
+      ? (typeof data?.[1] === 'string' ? data[1] : null)
+      : (Array.isArray(data?.[data.length - 1]) ? data[data.length - 1][0] : null);
+
   return { reviews, token };
 }
+
 
 /**
  * Updates the URL with a new page token for the 'entities' endpoint
@@ -515,7 +601,7 @@ async function scrapePlace(ctx: BrowserContext, pg: Client, src: SourceRow) {
     }
 
     // Insert reviews into database
-    await insertIfNew(pg, all);
+    await insert(pg, all);
     
     // Calculate duration
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
